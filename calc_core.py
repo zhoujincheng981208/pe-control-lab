@@ -100,16 +100,42 @@ def tune_one(L, R, Td, fc, PM_deg):
                 reason='')
 
 
+def lcl_metrics(L1, L2, Cf, Rd, fg, fsw, fc):
+    """LCL 滤波器谐振特性（三元件 L1/L2/Cf + 阻尼电阻 Rd）。
+    Leq = L1*L2/(L1+L2)              两电感并联等效
+    fres= 1/(2π√(Leq·Cf))           谐振频率
+    Zres= √(Leq/Cf)                  谐振特征阻抗
+    ζ   = Rd/(2·Zres)                串联阻尼电阻的无源阻尼比
+    工程校核：
+      fres 落在 (10·fg, 0.5·fsw)     远离工频与开关频率
+      fres/fc ≥ 2                    谐振峰与交越频率分离(推荐方案)
+      0.15 ≤ ζ ≤ 1.0                 阻尼充分且不过度
+    """
+    Leq  = L1*L2/(L1+L2)
+    fres = 1.0/(2*math.pi*math.sqrt(Leq*Cf))
+    Zres = math.sqrt(Leq/Cf)
+    zeta = Rd/(2*Zres) if Zres > 0 else 0.0
+    ratio = fres/fc if fc > 0 else 0.0
+    return dict(Leq=Leq, fres=fres, Zres=Zres, zeta=zeta, ratio=ratio,
+                chk_range=(10*fg < fres < 0.5*fsw),
+                chk_sep=(ratio >= 2.0),
+                chk_damp=(0.15 <= zeta <= 1.0))
+
+
 def solve(p):
     """主入口：按推荐方案生成保守/推荐/激进三方案对比"""
     L   = p['L_uh']*1e-6
     R   = p['R_ohm']
     fsw = p['fsw_khz']*1e3
     Td  = p['delay_Tsw']/fsw
+    lcl = None
     if p['filter'] == 'LCL':
         # 工程降阶：电容电流反馈有源阻尼后，逆变侧电流环等效取 L1
         L = p['L1_uh']*1e-6
         R = R + p['R_esr_extra']
+        # 三元件谐振特性（独立计算，不改整定用的 L1 等效对象）
+        lcl = lcl_metrics(L, p['L2_uh']*1e-6, p['Cf_uf']*1e-6,
+                          p['Rd_ohm'], p['fg_hz'], fsw, p['fc_hz'])
     fc0 = p['fc_hz']
     pm0 = p['PM_deg']
 
@@ -119,23 +145,32 @@ def solve(p):
         '激进': tune_one(L, R, Td, fc0*1.4, max(pm0-10, 20)),
     }
     return dict(L=L, R=R, Td=Td, fsw=fsw, schemes=schemes,
-                pm_max_rec=schemes['推荐']['pm_max'])
+                pm_max_rec=schemes['推荐']['pm_max'], lcl=lcl)
 
 
-P_DEMO = dict(filter='L', L_uh=250.0, L1_uh=250.0, R_ohm=0.05,
-              R_esr_extra=0.02, fsw_khz=5.0, delay_Tsw=1.5,
-              fc_hz=500.0, PM_deg=45.0)
+P_DEMO = dict(filter='L', L_uh=250.0, L1_uh=250.0, L2_uh=50.0, Cf_uf=270.0,
+              Rd_ohm=0.5, fg_hz=50.0, R_ohm=0.05, R_esr_extra=0.02,
+              fsw_khz=5.0, delay_Tsw=1.5, fc_hz=500.0, PM_deg=45.0)
+P_DEMO_LCL = dict(P_DEMO, filter='LCL')
 
 
 if __name__ == '__main__':
-    r = solve(P_DEMO)
-    print(f"对象: L={r['L']*1e6:.0f}uH R={r['R']:.3f}Ω Td={r['Td']*1e6:.0f}us fsw={r['fsw']/1e3:.0f}kHz")
-    print(f"推荐方案该频率下最大可达PM = {r['pm_max_rec']:.1f}°\n")
-    for name, s in r['schemes'].items():
-        print(f"--- {name} fc={s['fc']:.0f}Hz 目标PM={s['PM_req']:.0f}° ---")
-        if not s['feasible']:
-            print(f"  不可行: {s['reason']} (最大可达PM={s['pm_max']:.1f}°)")
-        else:
-            print(f"  Kp={s['Kp']:.4f}  Ki={s['Ki']:.1f}  实际PM={s['PM_act']:.1f}° "
-                  f"超调={s['ov']:.1f}%  调节时间={s['ts']:.2f}ms")
-            print(f"  幅值回校 |L(jwc)|={s['mag_ol']:.4f} (应≈1)")
+    for tag, par in [('L 滤波', P_DEMO), ('LCL 滤波', P_DEMO_LCL)]:
+        r = solve(par)
+        print(f"===== {tag} =====")
+        print(f"对象: L={r['L']*1e6:.0f}uH R={r['R']:.3f}Ω Td={r['Td']*1e6:.0f}us fsw={r['fsw']/1e3:.0f}kHz")
+        if r['lcl']:
+            q = r['lcl']
+            print(f"LCL: Leq={q['Leq']*1e6:.1f}uH fres={q['fres']:.0f}Hz Zres={q['Zres']:.3f}Ω "
+                  f"ζ={q['zeta']:.3f} fres/fc={q['ratio']:.2f}")
+            print(f"  校核: 谐振区间={q['chk_range']} 分离={q['chk_sep']} 阻尼={q['chk_damp']}")
+        print(f"推荐方案该频率下最大可达PM = {r['pm_max_rec']:.1f}°\n")
+        for name, s in r['schemes'].items():
+            print(f"--- {name} fc={s['fc']:.0f}Hz 目标PM={s['PM_req']:.0f}° ---")
+            if not s['feasible']:
+                print(f"  不可行: {s['reason']} (最大可达PM={s['pm_max']:.1f}°)")
+            else:
+                print(f"  Kp={s['Kp']:.4f}  Ki={s['Ki']:.1f}  实际PM={s['PM_act']:.1f}° "
+                      f"超调={s['ov']:.1f}%  调节时间={s['ts']:.2f}ms")
+                print(f"  幅值回校 |L(jwc)|={s['mag_ol']:.4f} (应≈1)")
+        print()
